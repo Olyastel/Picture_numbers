@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Local web app: recognize numbers in a photo and compare two arrays."""
 
 from __future__ import annotations
@@ -18,15 +19,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 try:
-    from PIL import Image, ImageOps
-except ImportError:
+    from PIL import Image, ImageFilter, ImageOps
+except ImportError:  # Show a useful error instead of failing at startup.
     Image = None
+    ImageFilter = None
     ImageOps = None
 
 
 MAX_NUMBERS = 54
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
-NUMBER_PATTERN = re.compile(r"(?<![A-Za-z0-9_])[+-]?\d+(?:\.\d+)?(?![A-Za-z0-9_])")
+NUMBER_PATTERN = re.compile(r"(?<!\d)\d{1,2}(?!\d)")
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD", "tesseract")
 
 
@@ -49,7 +51,7 @@ def extract_numbers(text: str) -> list[str]:
 def parse_array(text: str, label: str) -> list[str]:
     values = extract_numbers(text)
     if not values:
-        raise ValueError(f"В массиве {label} не найдено чисел.")
+        raise ValueError(f"В массиве {label} не найдено чисел от 0 до 99.")
     if len(values) > MAX_NUMBERS:
         raise ValueError(f"В массиве {label} найдено {len(values)} чисел. Максимум — {MAX_NUMBERS}.")
     return values
@@ -61,13 +63,28 @@ def image_to_png(image_bytes: bytes) -> bytes:
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
             image = ImageOps.exif_transpose(source).convert("L")
-            image = ImageOps.autocontrast(image)
+            image = ImageOps.autocontrast(image, cutoff=1)
+            # Remove broad empty margins so the number line fills more of the OCR image.
+            ink = image.point(lambda pixel: 255 if pixel < 175 else 0)
+            bounds = ink.getbbox()
+            if bounds:
+                left, top, right, bottom = bounds
+                padding = max(20, int(max(right - left, bottom - top) * 0.08))
+                bounds = (
+                    max(0, left - padding),
+                    max(0, top - padding),
+                    min(image.width, right + padding),
+                    min(image.height, bottom + padding),
+                )
+                image = image.crop(bounds)
+            # Upscale small phone images while keeping large photos manageable.
             if max(image.size) < 1800:
                 scale = min(3, 1800 / max(image.size))
                 image = image.resize((int(image.width * scale), int(image.height * scale)))
-            if max(image.size) > 5000:
-                scale = 5000 / max(image.size)
+            if max(image.size) > 3200:
+                scale = 3200 / max(image.size)
                 image = image.resize((int(image.width * scale), int(image.height * scale)))
+            image = image.filter(ImageFilter.UnsharpMask(radius=1, percent=130, threshold=3))
             output = io.BytesIO()
             image.save(output, format="PNG")
             return output.getvalue()
@@ -90,9 +107,13 @@ def recognize(image_bytes: bytes) -> tuple[str, list[str]]:
         "--oem",
         "1",
         "--psm",
-        "6",
+        "7",
         "-c",
-        "tessedit_char_whitelist=0123456789+-.,",
+        "tessedit_char_whitelist=0123456789,",
+        "-c",
+        "load_system_dawg=0",
+        "-c",
+        "load_freq_dawg=0",
         "-c",
         "preserve_interword_spaces=1",
     ]
@@ -194,30 +215,30 @@ PAGE = r"""<!doctype html>
 <body>
 <main>
   <h1>Сравнение массивов чисел</h1>
-  <p class="intro">Введите исходный массив, загрузите фото с числами и получите количество совпадений.</p>
+  <p class="intro">Введите исходный массив 1 текстом или с фотографии, затем загрузите фото массива 2.</p>
 
   <section class="card">
-    <h2>1. Исходный массив 1</h2>
-    <p class="hint">Введите до 54 чисел текстом или распознайте их с фотографии.</p>
-    <label for="m1">Числа 1</label>
+    <h2>1. Массив 1</h2>
+    <p class="hint">До 54 целых чисел от 0 до 99. Введите их через запятую или распознайте с фотографии. Массив 1 сохраняется в этом браузере.</p>
+    <label for="m1">Числа массива 1</label>
     <textarea id="m1" placeholder="Например: 12, 7, 4, 18, 7"></textarea>
     <div class="row" style="margin-top:12px">
       <input id="m1Photo" class="file-input" type="file" accept="image/*" capture="environment">
-      <label id="m1CameraButton" class="camera-button" for="m1Photo">Сфотографировать или загрузить 1</label>
+      <label id="m1CameraButton" class="camera-button" for="m1Photo">Сфотографировать или загрузить массив 1</label>
     </div>
     <p id="m1OcrMessage" class="message" aria-live="polite"></p>
   </section>
 
   <section class="card">
-    <h2>2. Распознавание фото → массив 2</h2>
-    <p class="hint">Нажмите кнопку, чтобы открыть камеру или выбрать готовое фото. Снимок загрузится автоматически; после распознавания сравнение запустится само. Можно исправить 2 вручную.</p>
+    <h2>2. Массив 2</h2>
+    <p class="hint">Нажмите кнопку, чтобы открыть камеру или выбрать фото. Числа лучше снять резко, на ровном фоне и одной горизонтальной строкой через запятую. Снимок загрузится автоматически; после распознавания сравнение запустится. Результат можно поправить вручную.</p>
     <div class="row">
       <input id="photo" class="file-input" type="file" accept="image/*" capture="environment">
-      <label id="cameraButton" class="camera-button" for="photo">Сделать фото или выбрать изображение</label>
+      <label id="cameraButton" class="camera-button" for="photo">Сфотографировать или загрузить массив 2</label>
     </div>
     <p id="ocrMessage" class="message" aria-live="polite"></p>
-    <label for="m2">Распознанный массив 2</label>
-    <textarea id="m2" placeholder="После загрузки фото числа появятся здесь; при необходимости отредактируйте их."></textarea>
+    <label for="m2">Числа массива 2</label>
+    <textarea id="m2" placeholder="Например: 12, 7, 4, 18, 7"></textarea>
   </section>
 
   <section class="card">
@@ -227,7 +248,7 @@ PAGE = r"""<!doctype html>
       <label><input type="radio" name="mode" value="unordered" checked> Без учёта порядка (повторы учитываются)</label>
       <label><input type="radio" name="mode" value="position"> Только одинаковые позиции</label>
     </fieldset>
-    <button id="compare" type="button">Сравнить 1 и 2</button>
+    <button id="compare" type="button">Сравнить массивы</button>
     <p id="compareMessage" class="message" aria-live="polite"></p>
     <div id="result" class="result" aria-live="polite">
       <div class="count" id="count">0</div>
@@ -237,14 +258,14 @@ PAGE = r"""<!doctype html>
         <summary>Показать отдельное сравнение</summary>
         <div class="details-grid">
           <div><strong>Совпавшие значения</strong><p id="matched"></p></div>
-          <div><strong>Есть в 1, нет на фото</strong><p id="missing"></p></div>
-          <div><strong>Есть на фото, нет в 1</strong><p id="extra"></p></div>
+          <div><strong>Есть в массиве 1, нет в массиве 2</strong><p id="missing"></p></div>
+          <div><strong>Есть в массиве 2, нет в массиве 1</strong><p id="extra"></p></div>
           <div><strong>Совпадения по позициям</strong><p id="positions"></p></div>
         </div>
       </details>
     </div>
   </section>
-  <p class="foot">Приложение работает в браузере телефона, без установки программ. При загрузке фотография передаётся серверу приложения для распознавания. Проверьте 2: качество снимка влияет на точность OCR.</p>
+  <p class="foot">Приложение работает в браузере телефона, без установки программ. Фотография передаётся серверу приложения для распознавания; проверьте числа перед сравнением.</p>
 </main>
 <script>
   const byId = id => document.getElementById(id);
@@ -266,32 +287,32 @@ PAGE = r"""<!doctype html>
     const file = byId('m1Photo').files[0];
     if (!file) return;
     const input = byId('m1Photo'); const button = byId('m1CameraButton');
-    input.disabled = true; button.classList.add('disabled'); button.textContent = 'Распознаю 1…';
-    showMessage('m1OcrMessage', 'Обрабатываю фото 1…');
+    input.disabled = true; button.classList.add('disabled'); button.textContent = 'Распознаю массив 1…';
+    showMessage('m1OcrMessage', 'Обрабатываю фото массива 1…');
     try {
       const data = await recognizeFile(file);
       byId('m1').value = data.numbers.join(', ');
       try { localStorage.setItem('arrayCompare.m1', byId('m1').value); } catch (_) {}
-      showMessage('m1OcrMessage', `Распознано чисел: ${data.numbers.length}. Проверьте 1 и при необходимости исправьте его.`);
+      showMessage('m1OcrMessage', `Найдено чисел: ${data.numbers.length}. Проверьте массив 1 и при необходимости исправьте его.`);
       if (byId('m2').value.trim()) await compareArrays();
-      else showMessage('compareMessage', '1 распознано. Теперь загрузите фото для массива 2.');
+      else showMessage('compareMessage', 'Теперь загрузите фото массива 2.');
     } catch (error) { showMessage('m1OcrMessage', error.message, true); }
-    finally { input.disabled = false; button.classList.remove('disabled'); button.textContent = 'Сфотографировать или загрузить 1'; input.value = ''; }
+    finally { input.disabled = false; button.classList.remove('disabled'); button.textContent = 'Сфотографировать или загрузить массив 1'; input.value = ''; }
   });
   byId('photo').addEventListener('change', async () => {
     const file = byId('photo').files[0];
     if (!file) return;
     const input = byId('photo'); const button = byId('cameraButton');
-    input.disabled = true; button.classList.add('disabled'); button.textContent = 'Распознаю фото…';
-    showMessage('ocrMessage', 'Обрабатываю фото…');
+    input.disabled = true; button.classList.add('disabled'); button.textContent = 'Распознаю массив 2…';
+    showMessage('ocrMessage', 'Обрабатываю фото массива 2…');
     try {
       const data = await recognizeFile(file);
       byId('m2').value = data.numbers.join(', ');
-      showMessage('ocrMessage', `Распознано чисел: ${data.numbers.length}. Проверьте 2 и при необходимости исправьте его.`);
+      showMessage('ocrMessage', `Найдено чисел: ${data.numbers.length}. Проверьте массив 2 и при необходимости исправьте его.`);
       if (byId('m1').value.trim()) await compareArrays();
-      else showMessage('compareMessage', 'Введите 1, чтобы посчитать совпадения.');
+      else showMessage('compareMessage', 'Введите или распознайте массив 1, чтобы посчитать совпадения.');
     } catch (error) { showMessage('ocrMessage', error.message, true); }
-    finally { input.disabled = false; button.classList.remove('disabled'); button.textContent = 'Сделать фото или выбрать изображение'; input.value = ''; }
+    finally { input.disabled = false; button.classList.remove('disabled'); button.textContent = 'Сфотографировать или загрузить массив 2'; input.value = ''; }
   });
   async function compareArrays() {
     const button = byId('compare'); button.disabled = true;
@@ -303,7 +324,7 @@ PAGE = r"""<!doctype html>
       if (!response.ok) throw new Error(data.error || 'Не удалось сравнить массивы.');
       byId('count').textContent = data.matched_count;
       byId('countLabel').textContent = data.matched_count === 1 ? 'совпадение' : (data.matched_count >= 2 && data.matched_count <= 4 ? 'совпадения' : 'совпадений');
-      byId('summary').textContent = `В 1: ${data.m1_count}; в 2: ${data.m2_count}. Совпадений без учёта порядка: ${data.by_value_count}.`;
+      byId('summary').textContent = `В массиве 1: ${data.m1_count}; в массиве 2: ${data.m2_count}. Совпадений без учёта порядка: ${data.by_value_count}.`;
       byId('matched').textContent = data.matched_values.length ? data.matched_values.map(item => `${item.value} × ${item.count}`).join(', ') : 'Нет';
       byId('missing').textContent = data.missing_from_photo.length ? data.missing_from_photo.join(', ') : 'Нет';
       byId('extra').textContent = data.extra_on_photo.length ? data.extra_on_photo.join(', ') : 'Нет';
@@ -371,7 +392,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("Файл слишком большой. Максимальный размер — 15 МБ.")
                 raw_text, numbers = recognize(image_bytes)
                 if not numbers:
-                    raise ValueError("На фото не удалось найти числа. Попробуйте более чёткий снимок или введите 2 вручную.")
+                    raise ValueError("На фото не найдены числа от 0 до 99. Снимите массив одной горизонтальной строкой, крупно и резко, или введите числа вручную.")
                 self.send_json({"numbers": numbers, "recognized_text": raw_text})
                 return
             if path == "/api/compare":
