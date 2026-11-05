@@ -4,32 +4,33 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import os
 import re
-import shutil
-import subprocess
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 try:
-    from PIL import Image, ImageFilter, ImageOps
+    from PIL import Image, ImageOps
 except ImportError:  # Show a useful error instead of failing at startup.
     Image = None
-    ImageFilter = None
     ImageOps = None
-
 
 MAX_NUMBERS = 54
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
-NUMBER_PATTERN = re.compile(r"(?<!\d)\d{1,2}(?!\d)")
-TESSERACT_CMD = os.environ.get("TESSERACT_CMD", "tesseract")
+NUMBER_PATTERN = re.compile(r"\d+")
+YANDEX_API_KEY = os.environ.get("YANDEX_API_KEY", "")
+YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID", "")
+YANDEX_OCR_MODEL = os.environ.get("YANDEX_OCR_MODEL", "handwritten")
+YANDEX_OCR_URL = "https://ai.api.cloud.yandex.net/ocr/v1/recognizeText"
 
 
 def canonical_number(value: Decimal) -> str:
@@ -52,83 +53,126 @@ def parse_array(text: str, label: str) -> list[str]:
     values = extract_numbers(text)
     if not values:
         raise ValueError(f"В массиве {label} не найдено чисел от 0 до 99.")
+    if any(Decimal(value) > 99 for value in values):
+        raise ValueError(f"В массиве {label} допустимы только целые числа от 0 до 99.")
     if len(values) > MAX_NUMBERS:
         raise ValueError(f"В массиве {label} найдено {len(values)} чисел. Максимум — {MAX_NUMBERS}.")
     return values
 
 
-def image_to_png(image_bytes: bytes) -> bytes:
+def prepare_image(image_bytes: bytes) -> bytes:
     if Image is None:
         raise RuntimeError("Не установлена библиотека Pillow. Выполните: python -m pip install -r requirements.txt")
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
-            image = ImageOps.exif_transpose(source).convert("L")
-            image = ImageOps.autocontrast(image, cutoff=1)
-            # Remove broad empty margins so the number line fills more of the OCR image.
-            ink = image.point(lambda pixel: 255 if pixel < 175 else 0)
-            bounds = ink.getbbox()
-            if bounds:
-                left, top, right, bottom = bounds
-                padding = max(20, int(max(right - left, bottom - top) * 0.08))
-                bounds = (
-                    max(0, left - padding),
-                    max(0, top - padding),
-                    min(image.width, right + padding),
-                    min(image.height, bottom + padding),
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            max_pixels = 20_000_000
+            if image.width * image.height > max_pixels:
+                scale = (max_pixels / (image.width * image.height)) ** 0.5
+                image = image.resize(
+                    (int(image.width * scale), int(image.height * scale)),
+                    Image.Resampling.LANCZOS,
                 )
-                image = image.crop(bounds)
-            # Upscale small phone images while keeping large photos manageable.
-            if max(image.size) < 1800:
-                scale = min(3, 1800 / max(image.size))
-                image = image.resize((int(image.width * scale), int(image.height * scale)))
-            if max(image.size) > 3200:
-                scale = 3200 / max(image.size)
-                image = image.resize((int(image.width * scale), int(image.height * scale)))
-            image = image.filter(ImageFilter.UnsharpMask(radius=1, percent=130, threshold=3))
-            output = io.BytesIO()
-            image.save(output, format="PNG")
-            return output.getvalue()
+            if max(image.size) > 3500:
+                scale = 3500 / max(image.size)
+                image = image.resize(
+                    (int(image.width * scale), int(image.height * scale)),
+                    Image.Resampling.LANCZOS,
+                )
+            for _ in range(8):
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=90, optimize=True)
+                encoded = output.getvalue()
+                if len(encoded) <= 9 * 1024 * 1024:
+                    return encoded
+                image = image.resize(
+                    (int(image.width * 0.9), int(image.height * 0.9)),
+                    Image.Resampling.LANCZOS,
+                )
+            raise ValueError("Фото слишком большое. Уменьшите его размер и загрузите снова.")
     except Exception as exc:
         raise ValueError("Не удалось открыть изображение. Загрузите фото в формате JPG, PNG или WEBP.") from exc
 
 
 def recognize(image_bytes: bytes) -> tuple[str, list[str]]:
-    executable = shutil.which(TESSERACT_CMD) if os.path.sep not in TESSERACT_CMD else TESSERACT_CMD
-    if not executable or not Path(executable).exists():
+    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
         raise RuntimeError(
-            "Не найден Tesseract OCR. Установите Tesseract и добавьте его в PATH "
-            "или укажите путь в переменной TESSERACT_CMD."
+            "Нейросеть не настроена: задайте на сервере YANDEX_API_KEY и YANDEX_FOLDER_ID."
         )
-    prepared = image_to_png(image_bytes)
-    command = [
-        executable,
-        "stdin",
-        "stdout",
-        "--oem",
-        "1",
-        "--psm",
-        "7",
-        "-c",
-        "tessedit_char_whitelist=0123456789,",
-        "-c",
-        "load_system_dawg=0",
-        "-c",
-        "load_freq_dawg=0",
-        "-c",
-        "preserve_interword_spaces=1",
-    ]
+    prepared = prepare_image(image_bytes)
+    payload = {
+        "mimeType": "JPEG",
+        "languageCodes": ["ru", "en"],
+        "model": YANDEX_OCR_MODEL,
+        "content": base64.b64encode(prepared).decode("ascii"),
+    }
+    request = Request(
+        YANDEX_OCR_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Api-Key {YANDEX_API_KEY}",
+            "x-folder-id": YANDEX_FOLDER_ID,
+        },
+        method="POST",
+    )
     try:
-        result = subprocess.run(command, input=prepared, capture_output=True, timeout=45, check=False)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Распознавание заняло слишком много времени. Попробуйте фото меньшего размера.") from exc
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError("Tesseract не смог обработать фото." + (f" {detail}" if detail else ""))
-    text = result.stdout.decode("utf-8", errors="replace")
-    values = extract_numbers(text)
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            raise RuntimeError(
+                "Yandex Vision OCR не принял ключ. Проверьте API-ключ, каталог и права на распознавание."
+            ) from exc
+        detail = ""
+        try:
+            error_payload = json.loads(exc.read().decode("utf-8"))
+            detail = error_payload.get("message") or error_payload.get("error", {}).get("message", "")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            pass
+        suffix = f" {detail}" if detail else ""
+        raise RuntimeError(f"Yandex Vision OCR вернул ошибку {exc.code}.{suffix}") from exc
+    except (TimeoutError, URLError) as exc:
+        raise RuntimeError("Yandex Vision OCR не ответил за 30 секунд. Попробуйте ещё раз.") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Ошибка запроса к Yandex Vision OCR: {exc}") from exc
+
+    # The current OCR API returns result.textAnnotation; accept the older list
+    # response too, so deployments remain compatible if the API response varies.
+    annotation = result.get("result", {}).get("textAnnotation") if isinstance(result, dict) else None
+    if annotation is None and isinstance(result, dict):
+        annotation = result.get("textAnnotation")
+    if annotation is None and isinstance(result, dict) and isinstance(result.get("result"), list):
+        chunks = []
+        for page in result["result"]:
+            text_annotation = page.get("textAnnotation", {}) if isinstance(page, dict) else {}
+            chunks.append(text_annotation.get("fullText", ""))
+        recognized_text = "\n".join(chunks)
+    elif isinstance(annotation, dict):
+        recognized_text = annotation.get("fullText", "")
+        if not recognized_text:
+            line_texts = []
+            for block in annotation.get("blocks", []):
+                for line in block.get("lines", []):
+                    if line.get("text"):
+                        line_texts.append(line["text"])
+                    else:
+                        line_texts.append(" ".join(
+                            word.get("text", "") for word in line.get("words", [])
+                        ))
+            recognized_text = "\n".join(line_texts)
+    else:
+        raise RuntimeError("Yandex Vision OCR вернул пустой или неизвестный ответ. Попробуйте другое фото.")
+
+    values = extract_numbers(recognized_text)
+    if any(Decimal(value) > 99 for value in values):
+        raise ValueError(
+            "Распознано число больше 99. Допустимы только однозначные и двузначные числа. "
+            "Проверьте, что на фото нет посторонних чисел, и переснимите массив крупнее."
+        )
     if len(values) > MAX_NUMBERS:
-        raise ValueError(f"На фото распознано {len(values)} чисел. Максимум — {MAX_NUMBERS}; проверьте фото.")
-    return text, values
+        raise ValueError(f"На фото найдено {len(values)} чисел. Максимум — {MAX_NUMBERS}; проверьте фото.")
+    return recognized_text, values
 
 
 def compare_arrays(m1: list[str], m2: list[str], mode: str) -> dict:
@@ -265,7 +309,7 @@ PAGE = r"""<!doctype html>
       </details>
     </div>
   </section>
-  <p class="foot">Приложение работает в браузере телефона, без установки программ. Фотография передаётся серверу приложения для распознавания; проверьте числа перед сравнением.</p>
+  <p class="foot">Фото отправляется в Yandex Vision OCR для распознавания. Сервис может ошибиться, поэтому проверьте распознанные числа перед сравнением.</p>
 </main>
 <script>
   const byId = id => document.getElementById(id);
