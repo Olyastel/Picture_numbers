@@ -4,19 +4,15 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import io
 import json
-import os
 import re
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 try:
     from PIL import Image, ImageOps
@@ -24,13 +20,14 @@ except ImportError:  # Show a useful error instead of failing at startup.
     Image = None
     ImageOps = None
 
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
 MAX_NUMBERS = 54
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 NUMBER_PATTERN = re.compile(r"\d+")
-YANDEX_API_KEY = os.environ.get("YANDEX_API_KEY", "")
-YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID", "")
-YANDEX_OCR_MODEL = os.environ.get("YANDEX_OCR_MODEL", "handwritten")
-YANDEX_OCR_URL = "https://ai.api.cloud.yandex.net/ocr/v1/recognizeText"
 
 
 def canonical_number(value: Decimal) -> str:
@@ -60,12 +57,58 @@ def parse_array(text: str, label: str) -> list[str]:
     return values
 
 
-def prepare_image(image_bytes: bytes) -> bytes:
+def is_lotto_ticket(image) -> tuple[bool, int]:
+    """Recognize the red-logo Russian Lotto card and return its grid's left edge."""
+    width, height = image.size
+    ratio = width / height
+    if not 1.35 <= ratio <= 2.5:
+        return False, 0
+
+    # Analyze a small preview so large phone photos stay cheap to inspect.
+    preview = image.copy()
+    preview.thumbnail((500, 500), Image.Resampling.LANCZOS)
+    pw, ph = preview.size
+    probe = preview.convert("RGB")
+    logo_right = -1
+    red_pixels = 0
+    left_limit = int(pw * 0.32)
+    top_limit = int(ph * 0.52)
+    for y in range(top_limit):
+        for x in range(left_limit):
+            red, green, blue = probe.getpixel((x, y))
+            if red > 125 and red > green * 1.35 and red > blue * 1.25:
+                red_pixels += 1
+                logo_right = max(logo_right, x)
+
+    region_size = max(1, left_limit * top_limit)
+    if red_pixels / region_size < 0.008 or logo_right < 0:
+        return False, 0
+
+    # Skip the logo panel and the printed ticket number. The grid begins just
+    # to the right of the red logo on this ticket layout.
+    crop_fraction = logo_right / pw + 0.05
+    crop_left = min(int(width * 0.38), max(int(width * 0.20), int(width * crop_fraction)))
+    return True, crop_left
+
+
+def prepare_image(image_bytes: bytes) -> tuple[bytes, bool]:
     if Image is None:
         raise RuntimeError("Не установлена библиотека Pillow. Выполните: python -m pip install -r requirements.txt")
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
+            ticket_mode, grid_left = is_lotto_ticket(image)
+            if ticket_mode:
+                image = image.crop((grid_left, 0, image.width, image.height))
+                # The number cells on a shared ticket photo can be small.
+                # Enlarging the cropped grid gives OCR more pixels per digit.
+                scale = min(3.0, 1100 / max(image.size))
+                if scale > 1:
+                    image = image.resize(
+                        (int(image.width * scale), int(image.height * scale)),
+                        Image.Resampling.LANCZOS,
+                    )
+                    image = ImageOps.autocontrast(image.convert("L")).convert("RGB")
             max_pixels = 20_000_000
             if image.width * image.height > max_pixels:
                 scale = (max_pixels / (image.width * image.height)) ** 0.5
@@ -84,7 +127,7 @@ def prepare_image(image_bytes: bytes) -> bytes:
                 image.save(output, format="JPEG", quality=90, optimize=True)
                 encoded = output.getvalue()
                 if len(encoded) <= 9 * 1024 * 1024:
-                    return encoded
+                    return encoded, ticket_mode
                 image = image.resize(
                     (int(image.width * 0.9), int(image.height * 0.9)),
                     Image.Resampling.LANCZOS,
@@ -94,77 +137,62 @@ def prepare_image(image_bytes: bytes) -> bytes:
         raise ValueError("Не удалось открыть изображение. Загрузите фото в формате JPG, PNG или WEBP.") from exc
 
 
-def recognize(image_bytes: bytes) -> tuple[str, list[str]]:
-    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
-        raise RuntimeError(
-            "Нейросеть не настроена: задайте на сервере YANDEX_API_KEY и YANDEX_FOLDER_ID."
-        )
-    prepared = prepare_image(image_bytes)
-    payload = {
-        "mimeType": "JPEG",
-        "languageCodes": ["ru", "en"],
-        "model": YANDEX_OCR_MODEL,
-        "content": base64.b64encode(prepared).decode("ascii"),
-    }
-    request = Request(
-        YANDEX_OCR_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Api-Key {YANDEX_API_KEY}",
-            "x-folder-id": YANDEX_FOLDER_ID,
-        },
-        method="POST",
-    )
+def recognize(image_bytes: bytes) -> tuple[str, list[str], bool]:
+    if Image is None or pytesseract is None:
+        raise RuntimeError("Локальный OCR не установлен. Пересоберите приложение через Docker.")
+    prepared, ticket_mode = prepare_image(image_bytes)
     try:
-        with urlopen(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        if exc.code in (401, 403):
-            raise RuntimeError(
-                "Yandex Vision OCR не принял ключ. Проверьте API-ключ, каталог и права на распознавание."
-            ) from exc
-        detail = ""
-        try:
-            error_payload = json.loads(exc.read().decode("utf-8"))
-            detail = error_payload.get("message") or error_payload.get("error", {}).get("message", "")
-        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
-            pass
-        suffix = f" {detail}" if detail else ""
-        raise RuntimeError(f"Yandex Vision OCR вернул ошибку {exc.code}.{suffix}") from exc
-    except (TimeoutError, URLError) as exc:
-        raise RuntimeError("Yandex Vision OCR не ответил за 30 секунд. Попробуйте ещё раз.") from exc
+        with Image.open(io.BytesIO(prepared)) as image:
+            image_width, image_height = image.size
+            data = pytesseract.image_to_data(
+                image,
+                lang="eng",
+                config="--psm 11 -c tessedit_char_whitelist=0123456789",
+                output_type=pytesseract.Output.DICT,
+                timeout=25,
+            )
+    except pytesseract.TesseractNotFoundError as exc:
+        raise RuntimeError("На сервере не найден Tesseract OCR. Пересоберите приложение через Docker.") from exc
+    except RuntimeError as exc:
+        raise RuntimeError("Локальный OCR не смог обработать фото. Попробуйте более чёткий снимок.") from exc
     except Exception as exc:
-        raise RuntimeError(f"Ошибка запроса к Yandex Vision OCR: {exc}") from exc
+        raise RuntimeError(f"Ошибка локального OCR: {exc}") from exc
 
-    # The current OCR API returns result.textAnnotation; accept the older list
-    # response too, so deployments remain compatible if the API response varies.
-    annotation = result.get("result", {}).get("textAnnotation") if isinstance(result, dict) else None
-    if annotation is None and isinstance(result, dict):
-        annotation = result.get("textAnnotation")
-    if annotation is None and isinstance(result, dict) and isinstance(result.get("result"), list):
-        chunks = []
-        for page in result["result"]:
-            text_annotation = page.get("textAnnotation", {}) if isinstance(page, dict) else {}
-            chunks.append(text_annotation.get("fullText", ""))
-        recognized_text = "\n".join(chunks)
-    elif isinstance(annotation, dict):
-        recognized_text = annotation.get("fullText", "")
-        if not recognized_text:
-            line_texts = []
-            for block in annotation.get("blocks", []):
-                for line in block.get("lines", []):
-                    if line.get("text"):
-                        line_texts.append(line["text"])
-                    else:
-                        line_texts.append(" ".join(
-                            word.get("text", "") for word in line.get("words", [])
-                        ))
-            recognized_text = "\n".join(line_texts)
+    recognized_words: list[str] = []
+    if ticket_mode:
+        # The Russian Lotto grid has 9 columns and 6 rows. Group OCR tokens by
+        # their cell so even sparse-text OCR stays in the ticket's reading order.
+        cell_width, cell_height = image_width / 9, image_height / 6
+        cells: dict[tuple[int, int], list[tuple[int, str]]] = {}
+        for index, text in enumerate(data.get("text", [])):
+            tokens = NUMBER_PATTERN.findall(str(text))
+            if not tokens:
+                continue
+            left = int(data["left"][index])
+            top = int(data["top"][index])
+            token_width = int(data["width"][index])
+            token_height = int(data["height"][index])
+            row = max(0, min(5, int((top + token_height / 2) / cell_height)))
+            column = max(0, min(8, int((left + token_width / 2) / cell_width)))
+            for token in tokens:
+                if len(token) <= 2:
+                    cells.setdefault((row, column), []).append((left, token))
+        for row in range(6):
+            for column in range(9):
+                pieces = sorted(cells.get((row, column), []))
+                number = "".join(piece for _, piece in pieces)
+                if number and len(number) <= 2:
+                    recognized_words.append(number)
     else:
-        raise RuntimeError("Yandex Vision OCR вернул пустой или неизвестный ответ. Попробуйте другое фото.")
+        order = sorted(
+            range(len(data.get("text", []))),
+            key=lambda index: (int(data["top"][index]), int(data["left"][index])),
+        )
+        for index in order:
+            recognized_words.extend(NUMBER_PATTERN.findall(str(data["text"][index])))
 
-    values = extract_numbers(recognized_text)
+    values = [canonical_number(Decimal(value)) for value in recognized_words]
+    recognized_text = ", ".join(values)
     if any(Decimal(value) > 99 for value in values):
         raise ValueError(
             "Распознано число больше 99. Допустимы только однозначные и двузначные числа. "
@@ -172,7 +200,7 @@ def recognize(image_bytes: bytes) -> tuple[str, list[str]]:
         )
     if len(values) > MAX_NUMBERS:
         raise ValueError(f"На фото найдено {len(values)} чисел. Максимум — {MAX_NUMBERS}; проверьте фото.")
-    return recognized_text, values
+    return recognized_text, values, ticket_mode
 
 
 def compare_arrays(m1: list[str], m2: list[str], mode: str) -> dict:
@@ -263,7 +291,7 @@ PAGE = r"""<!doctype html>
 
   <section class="card">
     <h2>1. Массив 1</h2>
-    <p class="hint">До 54 целых чисел от 0 до 99. Введите их через запятую или распознайте с фотографии. Массив 1 сохраняется в этом браузере.</p>
+    <p class="hint">До 54 целых чисел от 0 до 99. Введите их через запятую или распознайте с фотографии; билет «Русское лото» тоже можно загрузить целиком. Массив 1 сохраняется в этом браузере.</p>
     <label for="m1">Числа массива 1</label>
     <textarea id="m1" placeholder="Например: 12, 7, 4, 18, 7"></textarea>
     <div class="row" style="margin-top:12px">
@@ -275,7 +303,7 @@ PAGE = r"""<!doctype html>
 
   <section class="card">
     <h2>2. Массив 2</h2>
-    <p class="hint">Нажмите кнопку, чтобы открыть камеру или выбрать фото. Числа лучше снять резко, на ровном фоне и одной горизонтальной строкой через запятую. Снимок загрузится автоматически; после распознавания сравнение запустится. Результат можно поправить вручную.</p>
+    <p class="hint">Нажмите кнопку, чтобы открыть камеру или выбрать фото. Можно загрузить билет с числами в клетках: приложение обрежет логотип и номер билета, а затем распознает числа в сетке. Снимок загрузится автоматически; результат можно поправить вручную.</p>
     <div class="row">
       <input id="photo" class="file-input" type="file" accept="image/*" capture="environment">
       <label id="cameraButton" class="camera-button" for="photo">Сфотографировать или загрузить массив 2</label>
@@ -309,7 +337,7 @@ PAGE = r"""<!doctype html>
       </details>
     </div>
   </section>
-  <p class="foot">Фото отправляется в Yandex Vision OCR для распознавания. Сервис может ошибиться, поэтому проверьте распознанные числа перед сравнением.</p>
+  <p class="foot">Для билета «Русское лото» приложение распознаёт поле с клетками и пропускает логотип с номером билета. Распознавание выполняется на сервере, без отправки фото во внешний OCR-сервис; проверьте распознанные числа перед сравнением.</p>
 </main>
 <script>
   const byId = id => document.getElementById(id);
@@ -327,6 +355,11 @@ PAGE = r"""<!doctype html>
     if (!response.ok) throw new Error(data.error || 'Не удалось распознать фото.');
     return data;
   }
+  function recognitionMessage(data, label) {
+    const subject = data.ticket ? 'В сетке билета' : `В массиве ${label}`;
+    const ticketNote = data.ticket ? ' Номер билета исключён.' : '';
+    return `${subject} найдено чисел: ${data.numbers.length}.${ticketNote} Проверьте результат и при необходимости исправьте его.`;
+  }
   byId('m1Photo').addEventListener('change', async () => {
     const file = byId('m1Photo').files[0];
     if (!file) return;
@@ -337,7 +370,7 @@ PAGE = r"""<!doctype html>
       const data = await recognizeFile(file);
       byId('m1').value = data.numbers.join(', ');
       try { localStorage.setItem('arrayCompare.m1', byId('m1').value); } catch (_) {}
-      showMessage('m1OcrMessage', `Найдено чисел: ${data.numbers.length}. Проверьте массив 1 и при необходимости исправьте его.`);
+      showMessage('m1OcrMessage', recognitionMessage(data, '1'));
       if (byId('m2').value.trim()) await compareArrays();
       else showMessage('compareMessage', 'Теперь загрузите фото массива 2.');
     } catch (error) { showMessage('m1OcrMessage', error.message, true); }
@@ -352,7 +385,7 @@ PAGE = r"""<!doctype html>
     try {
       const data = await recognizeFile(file);
       byId('m2').value = data.numbers.join(', ');
-      showMessage('ocrMessage', `Найдено чисел: ${data.numbers.length}. Проверьте массив 2 и при необходимости исправьте его.`);
+      showMessage('ocrMessage', recognitionMessage(data, '2'));
       if (byId('m1').value.trim()) await compareArrays();
       else showMessage('compareMessage', 'Введите или распознайте массив 1, чтобы посчитать совпадения.');
     } catch (error) { showMessage('ocrMessage', error.message, true); }
@@ -434,10 +467,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 image_bytes = photo.get_payload(decode=True) or b""
                 if len(image_bytes) > MAX_UPLOAD_BYTES:
                     raise ValueError("Файл слишком большой. Максимальный размер — 15 МБ.")
-                raw_text, numbers = recognize(image_bytes)
+                raw_text, numbers, ticket_mode = recognize(image_bytes)
                 if not numbers:
-                    raise ValueError("На фото не найдены числа от 0 до 99. Снимите массив одной горизонтальной строкой, крупно и резко, или введите числа вручную.")
-                self.send_json({"numbers": numbers, "recognized_text": raw_text})
+                    raise ValueError("На фото не найдены числа от 0 до 99. Снимите числа или билет крупно, резко и без наклона, или введите массив вручную.")
+                self.send_json({"numbers": numbers, "recognized_text": raw_text, "ticket": ticket_mode})
                 return
             if path == "/api/compare":
                 try:
