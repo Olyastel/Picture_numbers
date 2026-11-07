@@ -21,12 +21,19 @@ except ImportError:  # Show a useful error instead of failing at startup.
     ImageOps = None
 
 try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener(thumbnails=False)
+except ImportError:
+    pass
+
+try:
     import pytesseract
 except ImportError:
     pytesseract = None
 
 MAX_NUMBERS = 54
-MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 NUMBER_PATTERN = re.compile(r"\d+")
 
 
@@ -134,7 +141,7 @@ def prepare_image(image_bytes: bytes) -> tuple[bytes, bool]:
                 )
             raise ValueError("Фото слишком большое. Уменьшите его размер и загрузите снова.")
     except Exception as exc:
-        raise ValueError("Не удалось открыть изображение. Загрузите фото в формате JPG, PNG или WEBP.") from exc
+        raise ValueError("Не удалось открыть изображение. Поддерживаются JPG, PNG, WEBP и HEIC/HEIF.") from exc
 
 
 def recognize_lotto_cells(image) -> list[str]:
@@ -298,7 +305,7 @@ PAGE = r"""<!doctype html>
     <label for="m1">Числа массива 1</label>
     <textarea id="m1" placeholder="Например: 12, 7, 4, 18, 7"></textarea>
     <div class="row" style="margin-top:12px">
-      <input id="m1Photo" class="file-input" type="file" accept="image/*" capture="environment">
+      <input id="m1Photo" class="file-input" type="file" accept="image/*,.heic,.heif" capture="environment">
       <label id="m1CameraButton" class="camera-button" for="m1Photo">Сфотографировать или загрузить массив 1</label>
     </div>
     <p id="m1OcrMessage" class="message" aria-live="polite"></p>
@@ -308,7 +315,7 @@ PAGE = r"""<!doctype html>
     <h2>2. Массив 2</h2>
     <p class="hint">Нажмите кнопку, чтобы открыть камеру или выбрать фото. Можно загрузить билет с числами в клетках: приложение обрежет логотип и номер билета, а затем распознает числа в сетке. Снимок загрузится автоматически; результат можно поправить вручную.</p>
     <div class="row">
-      <input id="photo" class="file-input" type="file" accept="image/*" capture="environment">
+      <input id="photo" class="file-input" type="file" accept="image/*,.heic,.heif" capture="environment">
       <label id="cameraButton" class="camera-button" for="photo">Сфотографировать или загрузить массив 2</label>
     </div>
     <p id="ocrMessage" class="message" aria-live="polite"></p>
@@ -439,7 +446,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if length <= 0:
             raise ValueError("Запрос пустой.")
         if length > MAX_UPLOAD_BYTES + 1024 * 1024:
-            raise ValueError("Файл слишком большой. Максимальный размер — 15 МБ.")
+            raise ValueError("Файл слишком большой. Максимальный размер — 30 МБ.")
         return self.rfile.read(length)
 
     def do_GET(self) -> None:
@@ -459,7 +466,7 @@ class AppHandler(BaseHTTPRequestHandler):
             body = self.read_body()
             if path == "/api/recognize":
                 if len(body) > MAX_UPLOAD_BYTES + 1024 * 1024:
-                    raise ValueError("Файл слишком большой. Максимальный размер — 15 МБ.")
+                    raise ValueError("Файл слишком большой. Максимальный размер — 30 МБ.")
                 message = BytesParser(policy=default).parsebytes(
                     b"Content-Type: " + self.headers.get("Content-Type", "").encode("ascii", errors="ignore")
                     + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
@@ -469,7 +476,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("Не найден загруженный файл.")
                 image_bytes = photo.get_payload(decode=True) or b""
                 if len(image_bytes) > MAX_UPLOAD_BYTES:
-                    raise ValueError("Файл слишком большой. Максимальный размер — 15 МБ.")
+                    raise ValueError("Файл слишком большой. Максимальный размер — 30 МБ.")
                 raw_text, numbers, ticket_mode = recognize(image_bytes)
                 if not numbers:
                     raise ValueError("На фото не найдены числа от 0 до 99. Снимите числа или билет крупно, резко и без наклона, или введите массив вручную.")
