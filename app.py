@@ -137,20 +137,57 @@ def prepare_image(image_bytes: bytes) -> tuple[bytes, bool]:
         raise ValueError("Не удалось открыть изображение. Загрузите фото в формате JPG, PNG или WEBP.") from exc
 
 
+def recognize_lotto_cells(image) -> list[str]:
+    """Read a Russian Lotto ticket one cell at a time to prevent merged digits."""
+    gray = ImageOps.autocontrast(image.convert("L"))
+    cell_width, cell_height = gray.width / 9, gray.height / 6
+    values: list[str] = []
+    config = "--psm 7 -c tessedit_char_whitelist=0123456789"
+
+    for row in range(6):
+        for column in range(9):
+            left = int(column * cell_width + cell_width * 0.12)
+            right = int((column + 1) * cell_width - cell_width * 0.12)
+            top = int(row * cell_height + cell_height * 0.12)
+            bottom = int((row + 1) * cell_height - cell_height * 0.12)
+            cell = gray.crop((left, top, right, bottom))
+
+            # Skip blank cells without starting an OCR process for them.
+            dark_pixels = sum(cell.histogram()[:150])
+            if dark_pixels < max(8, int(cell.width * cell.height * 0.003)):
+                continue
+
+            text = pytesseract.image_to_string(cell, lang="eng", config=config, timeout=5)
+            digits = "".join(NUMBER_PATTERN.findall(text))
+            if 1 <= len(digits) <= 2:
+                values.append(digits)
+    return values
+
+
 def recognize(image_bytes: bytes) -> tuple[str, list[str], bool]:
     if Image is None or pytesseract is None:
         raise RuntimeError("Локальный OCR не установлен. Пересоберите приложение через Docker.")
     prepared, ticket_mode = prepare_image(image_bytes)
     try:
         with Image.open(io.BytesIO(prepared)) as image:
-            image_width, image_height = image.size
-            data = pytesseract.image_to_data(
-                image,
-                lang="eng",
-                config="--psm 11 -c tessedit_char_whitelist=0123456789",
-                output_type=pytesseract.Output.DICT,
-                timeout=25,
-            )
+            if ticket_mode:
+                values = recognize_lotto_cells(image)
+            else:
+                data = pytesseract.image_to_data(
+                    image,
+                    lang="eng",
+                    config="--psm 11 -c tessedit_char_whitelist=0123456789",
+                    output_type=pytesseract.Output.DICT,
+                    timeout=25,
+                )
+                recognized_words: list[str] = []
+                order = sorted(
+                    range(len(data.get("text", []))),
+                    key=lambda index: (int(data["top"][index]), int(data["left"][index])),
+                )
+                for index in order:
+                    recognized_words.extend(NUMBER_PATTERN.findall(str(data["text"][index])))
+                values = [canonical_number(Decimal(value)) for value in recognized_words]
     except pytesseract.TesseractNotFoundError as exc:
         raise RuntimeError("На сервере не найден Tesseract OCR. Пересоберите приложение через Docker.") from exc
     except RuntimeError as exc:
@@ -158,40 +195,6 @@ def recognize(image_bytes: bytes) -> tuple[str, list[str], bool]:
     except Exception as exc:
         raise RuntimeError(f"Ошибка локального OCR: {exc}") from exc
 
-    recognized_words: list[str] = []
-    if ticket_mode:
-        # The Russian Lotto grid has 9 columns and 6 rows. Group OCR tokens by
-        # their cell so even sparse-text OCR stays in the ticket's reading order.
-        cell_width, cell_height = image_width / 9, image_height / 6
-        cells: dict[tuple[int, int], list[tuple[int, str]]] = {}
-        for index, text in enumerate(data.get("text", [])):
-            tokens = NUMBER_PATTERN.findall(str(text))
-            if not tokens:
-                continue
-            left = int(data["left"][index])
-            top = int(data["top"][index])
-            token_width = int(data["width"][index])
-            token_height = int(data["height"][index])
-            row = max(0, min(5, int((top + token_height / 2) / cell_height)))
-            column = max(0, min(8, int((left + token_width / 2) / cell_width)))
-            for token in tokens:
-                if len(token) <= 2:
-                    cells.setdefault((row, column), []).append((left, token))
-        for row in range(6):
-            for column in range(9):
-                pieces = sorted(cells.get((row, column), []))
-                number = "".join(piece for _, piece in pieces)
-                if number and len(number) <= 2:
-                    recognized_words.append(number)
-    else:
-        order = sorted(
-            range(len(data.get("text", []))),
-            key=lambda index: (int(data["top"][index]), int(data["left"][index])),
-        )
-        for index in order:
-            recognized_words.extend(NUMBER_PATTERN.findall(str(data["text"][index])))
-
-    values = [canonical_number(Decimal(value)) for value in recognized_words]
     recognized_text = ", ".join(values)
     if any(Decimal(value) > 99 for value in values):
         raise ValueError(
